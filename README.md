@@ -40,6 +40,108 @@ flowchart LR
 
 ---
 
+## For AI Agents: Automated Self-Setup / AI Agent 自动配置指南
+
+> **User Quick Prompt / 给其他 AI Agent 的一句话指令**：
+> ```text
+> Please read https://github.com/Jefferyu/gemini-web-mcp and follow the "For AI Agents: Automated Self-Setup" instructions in README.md to configure the gemini-web-mcp MCP server and the gemini-web skill for my current environment without overwriting my existing configs.
+> ```
+
+If you are an AI coding assistant (Antigravity, Claude Code, Cursor, Gemini CLI, Codex, etc.) asked to install and configure this MCP server for the user, follow these steps **in order**:
+
+### Step 1: Ensure `uv` is installed (Python >= 3.11 managed automatically)
+- Check `uv --version`.
+- If missing:
+  - macOS: `brew install uv` (or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+  - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+### Step 2: Choose Installation Mode
+- **Mode A (Recommended if installing Skill locally too)**: Clone the repo to a persistent local folder (e.g. `~/agent/gemini-web-mcp` or `~/.local/share/gemini-web-mcp`) and sync dependencies:
+  ```bash
+  git clone https://github.com/Jefferyu/gemini-web-mcp.git ~/gemini-web-mcp
+  cd ~/gemini-web-mcp
+  uv sync --python 3.12
+  # Optional: include --extra browser-cookies if the user wants automatic local browser cookie fallback
+  # uv sync --python 3.12 --extra browser-cookies
+  ```
+- **Mode B (Zero-clone via `uvx`)**: Run directly from GitHub without cloning:
+  ```bash
+  uvx --from git+https://github.com/Jefferyu/gemini-web-mcp.git gemini-web-mcp
+  ```
+
+### Step 3: Register MCP Server (Merge Only — NEVER Overwrite Existing Config!)
+Read the user's existing MCP configuration file first, preserve all existing `mcpServers` entries, and **merge** `"gemini-web-mcp"` into `mcpServers`:
+
+- **Antigravity**: `~/.gemini/config/mcp_config.json`
+- **Cursor**: `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project)
+- **Claude Code**: `claude mcp add ...` or `~/.claude.json` / `.mcp.json`
+- **Gemini CLI**: `~/.gemini/settings.json`
+
+Use **local clone** (`command: "uv"`):
+```json
+{
+  "mcpServers": {
+    "gemini-web-mcp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/gemini-web-mcp",
+        "run",
+        "gemini-web-mcp"
+      ],
+      "env": {
+        "GEMINI_WEB_MCP_LOG_LEVEL": "WARNING"
+      }
+    }
+  }
+}
+```
+Or **zero-clone** (`command: "uvx"`):
+```json
+{
+  "mcpServers": {
+    "gemini-web-mcp": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Jefferyu/gemini-web-mcp.git",
+        "gemini-web-mcp"
+      ],
+      "env": {
+        "GEMINI_WEB_MCP_LOG_LEVEL": "WARNING"
+      }
+    }
+  }
+}
+```
+> **Proxy Check (macOS GUI Apps)**: GUI apps do not inherit shell proxy env vars (`HTTPS_PROXY` / `HTTP_PROXY`). If the user's network requires a proxy to reach `gemini.google.com`, detect their local proxy or ask for the proxy URL and add `"GEMINI_WEB_MCP_PROXY": "http://127.0.0.1:<port>"` inside `"env"`.
+
+### Step 4: Install the `gemini-web` Skill (Progressive Disclosure)
+Install `examples/skills/gemini-web/SKILL.md` (raw URL: `https://raw.githubusercontent.com/Jefferyu/gemini-web-mcp/main/examples/skills/gemini-web/SKILL.md`) so the assistant knows when and how to invoke `gemini_ask` without bloating permanent context:
+
+- **Antigravity**:
+  - Global (all projects): `~/.gemini/config/skills/gemini-web/SKILL.md`
+  - Project-local: `.agents/skills/gemini-web/SKILL.md`
+- **Claude Code**:
+  - Global: `~/.claude/skills/gemini-web/SKILL.md`
+  - Project-local: `.claude/skills/gemini-web/SKILL.md`
+- **Optional Routing Rule**: Only if the user wants proactive routing in project rules, merge `examples/GEMINI.md` into `AGENTS.md` / `GEMINI.md` / `CLAUDE.md`.
+
+### Step 5: Verify MCP Handshake & Guide Cookie Setup
+1. Verify `stdio` JSON-RPC purity by sending an MCP `initialize` + `tools/list` payload and confirming `gemini_ask`, `gemini_sessions`, and `gemini_health` are returned cleanly on `stdout`.
+2. Check credential readiness (either via `gemini_health` after restart, or running `CookieBackend(Settings()).health()`).
+3. If `health()` reports missing cookies or macOS Safari/Keychain permission error:
+   - Never ask the user to paste cookies into chat if avoidable; instead instruct them to write `~/.config/gemini-web-mcp/cookies.json` directly:
+     ```json
+     {
+       "__Secure-1PSID": "paste-value-here",
+       "__Secure-1PSIDTS": "paste-value-if-present"
+     }
+     ```
+   - Or, on macOS with Safari logged in and `--extra browser-cookies` enabled, instruct them to grant **Full Disk Access** to the host app (Terminal / Antigravity) if they prefer automatic Safari cookie reading.
+
+---
+
 ## Installation & Running / 安装与运行
 
 Requires **Python >= 3.11** (managed via [`uv`](https://docs.astral.sh/uv/)).
@@ -47,7 +149,7 @@ Requires **Python >= 3.11** (managed via [`uv`](https://docs.astral.sh/uv/)).
 ### Option 1: From Local Checkout / 本地源码运行
 
 ```bash
-git clone https://github.com/<your-username>/gemini-web-mcp.git
+git clone https://github.com/Jefferyu/gemini-web-mcp.git
 cd gemini-web-mcp
 uv sync --python 3.12 --extra dev
 uv run gemini-web-mcp
@@ -56,7 +158,7 @@ uv run gemini-web-mcp
 ### Option 2: Direct via `uvx` from GitHub / 直接通过 `uvx` 运行
 
 ```bash
-uvx --from git+https://github.com/<your-username>/gemini-web-mcp.git gemini-web-mcp
+uvx --from git+https://github.com/Jefferyu/gemini-web-mcp.git gemini-web-mcp
 ```
 
 *(Once published to PyPI: `uvx gemini-web-mcp`)*
@@ -159,7 +261,7 @@ export GEMINI_SECURE_1PSIDTS="your-1psidts-cookie-value"
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/<your-username>/gemini-web-mcp.git",
+        "git+https://github.com/Jefferyu/gemini-web-mcp.git",
         "gemini-web-mcp"
       ],
       "env": {

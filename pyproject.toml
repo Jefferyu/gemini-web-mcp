@@ -43,6 +43,11 @@ dev = [
 [project.scripts]
 gemini-web-mcp = "gemini_web_mcp.server:main"
 
+[project.urls]
+Homepage = "https://github.com/Jefferyu/gemini-web-mcp"
+Repository = "https://github.com/Jefferyu/gemini-web-mcp"
+Issues = "https://github.com/Jefferyu/gemini-web-mcp/issues"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/gemini_web_mcp"]
 
