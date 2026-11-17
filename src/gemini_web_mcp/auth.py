@@ -96,6 +96,19 @@ def _default_browser_loader() -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = load_browser_cookies(
         domain_name="google.com", verbose=False
     )
+    if result:
+        return result
+
+    # Upstream load_browser_cookies swallows PermissionError (e.g. macOS Safari TCC).
+    # Probe Safari explicitly when nothing was loaded so the caller gets an actionable error.
+    try:
+        import browser_cookie3 as bc3
+
+        bc3.safari(domain_name="google.com")
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     return result
 
 
@@ -208,8 +221,8 @@ class AuthLoader:
             browser_cookies = self._browser_loader()
         except PermissionError as exc:
             raise AuthConfigurationError(
-                "Permission denied reading browser cookies (macOS Keychain / Chrome 130+ "
-                "App-Bound Encryption may block automated extraction). "
+                "Permission denied reading browser cookies (on macOS, Safari requires "
+                "Full Disk Access and Chrome 130+ / Keychain may block automated extraction). "
                 f"Please export cookies manually to {self.cookies_path} or set "
                 f"{_ENV_1PSID} / {_ENV_1PSIDTS}."
             ) from exc
