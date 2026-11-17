@@ -55,6 +55,21 @@ def test_auth_loader_env_priority(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert creds.secure_1psidts == "env-ts"
     assert creds.source == "env"
 
+    # Prefixed GEMINI_WEB_MCP_SECURE_1PSID takes precedence and works as an alias
+    loader_prefixed = AuthLoader(
+        cookies_path=cookies_file,
+        env={
+            "GEMINI_WEB_MCP_SECURE_1PSID": "prefixed-psid",
+            "GEMINI_WEB_MCP_SECURE_1PSIDTS": "prefixed-ts",
+            "GEMINI_SECURE_1PSID": "legacy-psid",
+        },
+        browser_loader=lambda: {},
+    )
+    creds_prefixed = loader_prefixed.load()
+    assert creds_prefixed.secure_1psid == "prefixed-psid"
+    assert creds_prefixed.secure_1psidts == "prefixed-ts"
+    assert creds_prefixed.source == "env"
+
 
 def test_auth_loader_dict_and_array_cookies_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -169,3 +184,21 @@ def test_auth_loader_browser_fallback_and_errors(tmp_path: Path) -> None:
     loader_bad = AuthLoader(cookies_path=bad_file, env={}, browser_loader=lambda: {})
     with pytest.raises(AuthConfigurationError, match="__Secure-1PSID"):
         loader_bad.load()
+
+    # enable_browser_cookies=False skips browser_loader completely
+    browser_called = False
+
+    def should_not_be_called() -> dict[str, list[dict[str, object]]]:
+        nonlocal browser_called
+        browser_called = True
+        return {"chrome": [{"name": "__Secure-1PSID", "value": "x"}]}
+
+    loader_no_browser = AuthLoader(
+        cookies_path=missing_file,
+        env={},
+        browser_loader=should_not_be_called,
+        enable_browser_cookies=False,
+    )
+    with pytest.raises(AuthConfigurationError, match="No Gemini Web cookies found"):
+        loader_no_browser.load()
+    assert browser_called is False

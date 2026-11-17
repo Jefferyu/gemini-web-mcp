@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from gemini_web_mcp.sessions import SessionRecord, SessionStore
@@ -86,29 +88,37 @@ async def test_session_same_label_lock_serializes(tmp_path: Path) -> None:
     )
     assert diff_events.index("start:b") < diff_events.index("end:a")
 
+    # Idle locks are automatically garbage-collected via WeakValueDictionary
+    gc.collect()
+    assert len(store._locks) == 0
+
 
 def test_two_independent_stores_concurrent_writes(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     store_a = SessionStore(db_path)
     store_b = SessionStore(db_path)
 
-    for idx in range(25):
-        store_a.upsert(
-            SessionRecord(
-                label=f"win-a-{idx}",
-                metadata=[f"cid_a_{idx}", f"rid_a_{idx}", f"rcid_a_{idx}", f"esid_a_{idx}"],
-                model="gemini-flash",
-                turn_count=idx + 1,
+    def write_batch(store: SessionStore, prefix: str, model: str) -> None:
+        for idx in range(25):
+            store.upsert(
+                SessionRecord(
+                    label=f"{prefix}-{idx}",
+                    metadata=[
+                        f"cid_{prefix}_{idx}",
+                        f"rid_{prefix}_{idx}",
+                        f"rcid_{prefix}_{idx}",
+                        f"esid_{prefix}_{idx}",
+                    ],
+                    model=model,
+                    turn_count=idx + 1,
+                )
             )
-        )
-        store_b.upsert(
-            SessionRecord(
-                label=f"win-b-{idx}",
-                metadata=[f"cid_b_{idx}", f"rid_b_{idx}", f"rcid_b_{idx}", f"esid_b_{idx}"],
-                model="gemini-pro",
-                turn_count=idx + 1,
-            )
-        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_a = pool.submit(write_batch, store_a, "win-a", "gemini-flash")
+        fut_b = pool.submit(write_batch, store_b, "win-b", "gemini-pro")
+        fut_a.result()
+        fut_b.result()
 
     all_records = store_a.list_sessions()
     assert len(all_records) == 50

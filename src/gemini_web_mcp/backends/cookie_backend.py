@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from gemini_webapi import GeminiClient
+from gemini_webapi.constants import AccountStatus
 from gemini_webapi.exceptions import (
     APIError,
     AuthError,
@@ -69,22 +70,48 @@ class CookieBackend(GeminiBackend):
         client_factory: Callable[[str, str | None, str | None], Any] | None = None,
     ) -> None:
         self._settings = settings
-        self._auth_loader = auth_loader or AuthLoader(cookies_path=settings.cookies_path)
+        self._auth_loader = auth_loader or AuthLoader(
+            cookies_path=settings.cookies_path,
+            enable_browser_cookies=settings.enable_browser_cookies,
+        )
         self._client_factory = client_factory or _default_client_factory
         self._init_lock = asyncio.Lock()
         self._client: Any | None = None
         self._credentials: AuthCredentials | None = None
+        self._cookies_mtime_ns: int | None = None
         self._initialized = False
+
+    def _get_cookies_mtime_ns(self) -> int | None:
+        try:
+            return self._settings.cookies_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _is_client_usable(self) -> bool:
+        if not self._initialized or self._client is None:
+            return False
+        if getattr(self._client, "_running", True) is False:
+            return False
+        account_status = getattr(self._client, "account_status", None)
+        if account_status is not None and account_status != AccountStatus.AVAILABLE:
+            return False
+        return self._get_cookies_mtime_ns() == self._cookies_mtime_ns
 
     async def init(self) -> None:
         """Lazily initialize GeminiClient once using double-checked locking."""
-        if self._initialized and self._client is not None:
+        if self._is_client_usable():
             return
 
         async with self._init_lock:
-            if self._initialized and self._client is not None:
+            if self._is_client_usable():
                 return
 
+            if self._client is not None:
+                await self._safe_close_client(self._client)
+                self._client = None
+                self._initialized = False
+
+            cookies_mtime_ns = self._get_cookies_mtime_ns()
             try:
                 creds = self._auth_loader.load(prefer_rotated_cache=True)
             except AuthConfigurationError as exc:
@@ -93,8 +120,8 @@ class CookieBackend(GeminiBackend):
             try:
                 client = await self._init_client(creds)
             except AuthError as first_err:
-                if "rotated-cache" in creds.source:
-                    clear_rotated_cache(creds.secure_1psid)
+                cleared_cache = clear_rotated_cache(creds.secure_1psid)
+                if "rotated-cache" in creds.source or cleared_cache:
                     try:
                         creds = self._auth_loader.load(prefer_rotated_cache=False)
                         client = await self._init_client(creds)
@@ -108,6 +135,7 @@ class CookieBackend(GeminiBackend):
                 raise self._translate_exception(exc, context="init") from exc
 
             self._credentials = creds
+            self._cookies_mtime_ns = cookies_mtime_ns
             self._client = client
             self._initialized = True
 
@@ -117,13 +145,28 @@ class CookieBackend(GeminiBackend):
             creds.secure_1psidts,
             self._settings.proxy,
         )
+        max_timeout = float(
+            max(self._settings.timeout_seconds, self._settings.thinking_timeout_seconds)
+        )
         try:
             await client.init(
-                timeout=float(self._settings.timeout_seconds),
+                timeout=max_timeout,
+                watchdog_timeout=max_timeout,
                 auto_close=False,
                 auto_refresh=True,
                 verbose=False,
             )
+            cookie_source = str(getattr(client, "_cookie_source", "") or "")
+            account_status = getattr(client, "account_status", None)
+            if cookie_source == "Guest" or account_status == AccountStatus.UNAUTHENTICATED:
+                raise AuthError(
+                    "Gemini Web cookies expired or invalid "
+                    "(session downgraded to unauthenticated/guest mode)."
+                )
+            if account_status is not None and account_status != AccountStatus.AVAILABLE:
+                status_name = getattr(account_status, "name", str(account_status))
+                status_desc = getattr(account_status, "description", "Account is not available.")
+                raise GeminiError(f"Gemini account unavailable ({status_name}): {status_desc}")
         except Exception:
             await self._safe_close_client(client)
             raise
@@ -145,6 +188,11 @@ class CookieBackend(GeminiBackend):
         if not lowered or lowered in ("default", "unspecified"):
             return "unspecified"
 
+        if lowered.endswith(("-thinking", "+thinking")):
+            base_raw = raw[:-9].strip()
+            if base_raw:
+                return f"{self.normalize_model(base_raw)}-thinking"
+
         if self._initialized and self._client is not None:
             try:
                 resolved = self._client.resolve_model(raw)
@@ -158,9 +206,7 @@ class CookieBackend(GeminiBackend):
 
         return _CANONICAL_MODEL_ALIASES.get(lowered, lowered)
 
-    def _resolve_model_and_thinking(
-        self, requested_model: str | None
-    ) -> tuple[Any, str, bool]:
+    def _resolve_model_and_thinking(self, requested_model: str | None) -> tuple[Any, str, bool]:
         """Map requested model string to (client_model_arg, resolved_name, extended_thinking)."""
         assert self._client is not None
         raw = (requested_model or self._settings.default_model or "unspecified").strip()
@@ -169,14 +215,38 @@ class CookieBackend(GeminiBackend):
         if not lowered or lowered in ("default", "unspecified"):
             return None, "unspecified", False
 
+        if lowered.endswith(("-thinking", "+thinking")):
+            base_raw = raw[:-9].strip()
+            if base_raw:
+                try:
+                    base_resolved = self._client.resolve_model(base_raw)
+                    if getattr(base_resolved, "is_available", True) is False:
+                        raise ModelInvalidError(f"Model '{base_raw}' is not available.")
+                    base_name = (
+                        str(getattr(base_resolved, "model_name", "") or base_resolved).strip()
+                        or base_raw
+                    )
+                    return base_resolved, f"{base_name}-thinking", True
+                except ValueError:
+                    pass
+
         is_thinking = "thinking" in lowered
         try:
             resolved = self._client.resolve_model(raw)
+            if getattr(resolved, "is_available", True) is False:
+                raise ModelInvalidError(f"Model '{raw}' is not available for this account.")
             resolved_name = str(getattr(resolved, "model_name", "") or resolved).strip() or raw
             return resolved, resolved_name, is_thinking
         except ValueError as exc:
-            if lowered == "thinking":
-                return None, "thinking", True
+            if lowered in ("thinking", "gemini-thinking"):
+                backing_model: Any = None
+                for fallback_alias in ("pro", "flash"):
+                    with contextlib.suppress(Exception):
+                        candidate = self._client.resolve_model(fallback_alias)
+                        if getattr(candidate, "is_available", True) is not False:
+                            backing_model = candidate
+                            break
+                return backing_model, "thinking", True
             available = self._get_available_model_names()
             available_hint = ", ".join(available) if available else "none discovered"
             raise BackendError(
@@ -195,22 +265,44 @@ class CookieBackend(GeminiBackend):
             return []
         names: list[str] = []
         for item in models:
+            if getattr(item, "is_available", True) is False:
+                continue
             name = getattr(item, "model_name", None) or str(item)
             if name:
                 names.append(str(name))
         return names
 
+    def _is_runtime_auth_failure(self, exc: Exception) -> bool:
+        if isinstance(exc, AuthError):
+            return True
+        account_status = getattr(self._client, "account_status", None)
+        return isinstance(exc, GeminiError) and account_status == AccountStatus.UNAUTHENTICATED
+
     async def ask(self, req: AskRequest) -> AskResponse:
         """Send a text/multimodal prompt to Gemini Web."""
         await self.init()
+        return await self._execute_ask(req, allow_auth_retry=True)
+
+    async def _execute_ask(self, req: AskRequest, *, allow_auth_retry: bool) -> AskResponse:
         assert self._client is not None
 
-        model_arg, resolved_name, is_thinking = self._resolve_model_and_thinking(req.model)
+        try:
+            model_arg, resolved_name, is_thinking = self._resolve_model_and_thinking(req.model)
+        except ModelInvalidError as exc:
+            raise self._translate_exception(exc, context="ask") from exc
+
         effective_timeout = req.timeout_seconds or (
             self._settings.thinking_timeout_seconds
             if is_thinking
             else self._settings.timeout_seconds
         )
+
+        client_timeout = getattr(self._client, "timeout", None)
+        if isinstance(client_timeout, (int, float)) and effective_timeout > client_timeout:
+            self._client.timeout = float(effective_timeout)
+        watchdog_timeout = getattr(self._client, "watchdog_timeout", None)
+        if isinstance(watchdog_timeout, (int, float)) and effective_timeout > watchdog_timeout:
+            self._client.watchdog_timeout = float(effective_timeout)
 
         chat_kwargs: dict[str, Any] = {}
         if req.metadata:
@@ -226,14 +318,34 @@ class CookieBackend(GeminiBackend):
         }
 
         try:
-            output = await chat.send_message(req.prompt, **send_kwargs)
+            output = await asyncio.wait_for(
+                chat.send_message(req.prompt, **send_kwargs),
+                timeout=float(effective_timeout),
+            )
         except Exception as exc:
+            if self._is_runtime_auth_failure(exc):
+                failed_creds = self._credentials
+                if failed_creds is not None:
+                    clear_rotated_cache(failed_creds.secure_1psid)
+                await self.close()
+
+                if allow_auth_retry and failed_creds is not None:
+                    with contextlib.suppress(AuthConfigurationError):
+                        fresh_creds = self._auth_loader.load(prefer_rotated_cache=False)
+                        if (fresh_creds.secure_1psid, fresh_creds.secure_1psidts) != (
+                            failed_creds.secure_1psid,
+                            failed_creds.secure_1psidts,
+                        ):
+                            await self.init()
+                            return await self._execute_ask(req, allow_auth_retry=False)
+
+                auth_exc = exc if isinstance(exc, AuthError) else AuthError(str(exc))
+                raise self._translate_exception(auth_exc, context="ask") from exc
+
             raise self._translate_exception(exc, context="ask") from exc
 
         raw_metadata = getattr(output, "metadata", None) or getattr(chat, "metadata", None) or []
-        metadata: list[str | None] = [
-            None if item is None else str(item) for item in raw_metadata
-        ]
+        metadata: list[str | None] = [None if item is None else str(item) for item in raw_metadata]
         thoughts_raw = getattr(output, "thoughts", None)
         thoughts = str(thoughts_raw) if (req.include_thoughts and thoughts_raw) else None
 
@@ -276,6 +388,7 @@ class CookieBackend(GeminiBackend):
         async with self._init_lock:
             client = self._client
             self._client = None
+            self._cookies_mtime_ns = None
             self._initialized = False
             await self._safe_close_client(client)
 
@@ -302,9 +415,7 @@ class CookieBackend(GeminiBackend):
             )
 
         if isinstance(exc, UsageLimitExceededError):
-            return BackendError(
-                f"Gemini Web usage limit exceeded for the selected model: {exc}"
-            )
+            return BackendError(f"Gemini Web usage limit exceeded for the selected model: {exc}")
 
         if isinstance(exc, ModelInvalidError):
             available = ", ".join(self._get_available_model_names()) or "none"

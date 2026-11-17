@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+_ENV_1PSID_KEYS = ("GEMINI_WEB_MCP_SECURE_1PSID", "GEMINI_SECURE_1PSID")
+_ENV_1PSIDTS_KEYS = ("GEMINI_WEB_MCP_SECURE_1PSIDTS", "GEMINI_SECURE_1PSIDTS")
 _ENV_1PSID = "GEMINI_SECURE_1PSID"
 _ENV_1PSIDTS = "GEMINI_SECURE_1PSIDTS"
 _COOKIE_1PSID = "__Secure-1PSID"
@@ -147,12 +149,14 @@ class AuthLoader:
         *,
         env: Mapping[str, str] | None = None,
         browser_loader: Callable[[], dict[str, list[dict[str, Any]]]] | None = None,
+        enable_browser_cookies: bool = True,
     ) -> None:
         self.cookies_path = (
             cookies_path
             if cookies_path is not None
             else Path("~/.config/gemini-web-mcp/cookies.json").expanduser()
         )
+        self.enable_browser_cookies = enable_browser_cookies
         self._env = env if env is not None else os.environ
         self._browser_loader = (
             browser_loader if browser_loader is not None else _default_browser_loader
@@ -163,7 +167,7 @@ class AuthLoader:
         creds = self._load_from_env()
         if creds is None:
             creds = self._load_from_file()
-        if creds is None:
+        if creds is None and self.enable_browser_cookies:
             creds = self._load_from_browser()
         if creds is None:
             raise AuthConfigurationError(self._missing_credentials_message())
@@ -180,10 +184,21 @@ class AuthLoader:
         return creds
 
     def _load_from_env(self) -> AuthCredentials | None:
-        psid = self._env.get(_ENV_1PSID, "").strip()
+        psid = ""
+        for key in _ENV_1PSID_KEYS:
+            candidate = self._env.get(key, "").strip()
+            if candidate:
+                psid = candidate
+                break
         if not psid:
             return None
-        psidts = self._env.get(_ENV_1PSIDTS, "").strip() or None
+
+        psidts: str | None = None
+        for key in _ENV_1PSIDTS_KEYS:
+            candidate = self._env.get(key, "").strip()
+            if candidate:
+                psidts = candidate
+                break
         return AuthCredentials(secure_1psid=psid, secure_1psidts=psidts, source="env")
 
     def _load_from_file(self) -> AuthCredentials | None:

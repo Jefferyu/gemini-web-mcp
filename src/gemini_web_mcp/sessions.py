@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -34,7 +35,7 @@ class SessionStore:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path).expanduser()
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -66,7 +67,10 @@ class SessionStore:
     @asynccontextmanager
     async def lock(self, label: str) -> AsyncIterator[None]:
         """Serialize requests sharing the same session label within this process."""
-        label_lock = self._locks.setdefault(label, asyncio.Lock())
+        label_lock = self._locks.get(label)
+        if label_lock is None:
+            label_lock = asyncio.Lock()
+            self._locks[label] = label_lock
         async with label_lock:
             yield
 

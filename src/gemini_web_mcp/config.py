@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     backend: str = "cookie"
     default_model: str = "unspecified"
     proxy: str | None = None
+    enable_browser_cookies: bool = True
     cookies_path: Path = Field(
         default_factory=lambda: Path("~/.config/gemini-web-mcp/cookies.json").expanduser()
     )
@@ -55,7 +56,13 @@ class Settings(BaseSettings):
     thinking_timeout_seconds: int = Field(default=300, ge=1)
     max_files_per_request: int = Field(default=10, ge=1)
     max_file_size_mb: int = Field(default=20, ge=1)
+    max_total_file_size_mb: int = Field(default=50, ge=1)
     log_level: str = "WARNING"
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_backend(cls, value: str) -> str:
+        return value.strip().lower() or "cookie"
 
     @field_validator("cookies_path", "sessions_db_path", mode="before")
     @classmethod

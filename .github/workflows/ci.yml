@@ -24,10 +24,13 @@ jobs:
           enable-cache: true
 
       - name: Set up Python ${{ matrix.python-version }} and sync dependencies
-        run: uv sync --python ${{ matrix.python-version }} --extra dev
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev --extra browser-cookies
 
       - name: Run Ruff lint check
         run: uv run ruff check src tests
+
+      - name: Run Ruff format check
+        run: uv run ruff format --check src tests
 
       - name: Run Mypy strict type check
         run: uv run mypy src

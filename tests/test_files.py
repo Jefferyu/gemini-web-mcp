@@ -35,6 +35,14 @@ def test_validate_upload_files_count_and_size_limits(tmp_path: Path) -> None:
     with pytest.raises(FileValidationError, match="exceeding the 1 MB limit"):
         validate_upload_files([big_file], max_size_mb=1)
 
+    # Total size cap across multiple files
+    part_a = tmp_path / "part_a.bin"
+    part_b = tmp_path / "part_b.bin"
+    part_a.write_bytes(b"a" * (2 * 1024 * 1024))
+    part_b.write_bytes(b"b" * (2 * 1024 * 1024))
+    with pytest.raises(FileValidationError, match="Total upload size"):
+        validate_upload_files([part_a, part_b], max_size_mb=5, max_total_size_mb=3)
+
 
 def test_validate_upload_files_rejects_missing_and_dir(tmp_path: Path) -> None:
     with pytest.raises(FileValidationError, match="does not exist"):
@@ -75,10 +83,36 @@ def test_validate_upload_files_blocks_sensitive_paths_and_symlinks(
     with pytest.raises(FileValidationError, match="environment secret"):
         validate_upload_files([dotenv_local])
 
-    # Protected extra files (cookies.json, sessions.db)
+    # Protected extra files (cookies.json, sessions.db, plus -wal/-shm sidecars)
     cookies_file = tmp_path / "cookies.json"
     cookies_file.write_text("{}", encoding="utf-8")
     cookies_link = tmp_path / "alias.json"
     os.symlink(cookies_file, cookies_link)
     with pytest.raises(FileValidationError, match="protected application file"):
         validate_upload_files([cookies_link], extra_blocked_paths=[cookies_file])
+
+    sessions_db = tmp_path / "sessions.db"
+    sessions_wal = tmp_path / "sessions.db-wal"
+    sessions_wal.write_text("wal-bytes", encoding="utf-8")
+    with pytest.raises(FileValidationError, match="protected application file"):
+        validate_upload_files([sessions_wal], extra_blocked_paths=[sessions_db])
+
+    # Case-insensitive .ENV, .envrc, and credential files (.npmrc)
+    upper_env = tmp_path / ".ENV"
+    upper_env.write_text("SECRET=3", encoding="utf-8")
+    with pytest.raises(FileValidationError, match="environment secret"):
+        validate_upload_files([upper_env])
+
+    npmrc = tmp_path / ".npmrc"
+    npmrc.write_text("//registry.npmjs.org/:_authToken=secret", encoding="utf-8")
+    with pytest.raises(FileValidationError, match="credential file"):
+        validate_upload_files([npmrc])
+
+    # Upstream rotated cookie cache directory is blocked automatically
+    cache_dir = tmp_path / "gemini_cookie_cache"
+    cache_dir.mkdir()
+    cached_cookie = cache_dir / ".cached_cookies_abc.json"
+    cached_cookie.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(cache_dir))
+    with pytest.raises(FileValidationError, match="restricted directory"):
+        validate_upload_files([cached_cookie])

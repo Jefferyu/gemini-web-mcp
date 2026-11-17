@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+from gemini_webapi.constants import AccountStatus
 from gemini_webapi.exceptions import AuthError
 from gemini_webapi.exceptions import TimeoutError as GeminiTimeoutError
 
 from gemini_web_mcp.auth import AuthLoader, get_rotated_cache_path
+from gemini_web_mcp.backends import create_backend
 from gemini_web_mcp.backends.base import AskRequest, BackendError
 from gemini_web_mcp.backends.cookie_backend import CookieBackend
 from gemini_web_mcp.config import Settings
@@ -21,6 +24,7 @@ from gemini_web_mcp.config import Settings
 class FakeAvailableModel:
     model_name: str
     model_id: str = "hex123"
+    is_available: bool = True
 
 
 @dataclass
@@ -67,7 +71,13 @@ class FakeGeminiClient:
         self.secure_1psidts = secure_1psidts
         self.proxy = proxy
         self.init_calls = 0
+        self.init_kwargs: dict[str, Any] = {}
         self.closed = False
+        self._running = False
+        self.account_status = AccountStatus.AVAILABLE
+        self._cookie_source = "Base Cookies"
+        self.timeout = 450.0
+        self.watchdog_timeout = 120.0
         self.sent_calls: list[dict[str, Any]] = []
         self.models = [
             FakeAvailableModel("gemini-flash", "id_flash"),
@@ -77,6 +87,12 @@ class FakeGeminiClient:
     async def init(self, **kwargs: Any) -> None:
         await asyncio.sleep(0.02)
         self.init_calls += 1
+        self.init_kwargs = dict(kwargs)
+        if "timeout" in kwargs:
+            self.timeout = float(kwargs["timeout"])
+        if "watchdog_timeout" in kwargs:
+            self.watchdog_timeout = float(kwargs["watchdog_timeout"])
+        self._running = True
 
     def list_models(self) -> list[FakeAvailableModel]:
         return list(self.models)
@@ -93,6 +109,7 @@ class FakeGeminiClient:
 
     async def close(self) -> None:
         self.closed = True
+        self._running = False
 
 
 async def test_cookie_backend_concurrent_init_once_and_ask(tmp_path: Path) -> None:
@@ -172,9 +189,22 @@ async def test_cookie_backend_thinking_mode_and_timeout(tmp_path: Path) -> None:
 
     res = await backend.ask(AskRequest(prompt="deep question", model="thinking"))
     assert res.resolved_model == "thinking"
-    call = created_clients[0].sent_calls[0]
+    client = created_clients[0]
+    assert client.timeout == 300.0
+    assert client.watchdog_timeout == 300.0
+    call = client.sent_calls[0]
     assert call["extended_thinking"] is True
     assert call["timeout"] == 300.0
+    # Backing model header is resolved (gemini-pro) instead of sending None
+    assert call["model"] is not None
+    assert call["model"].model_name == "gemini-pro"
+
+    # Explicit <model>-thinking alias resolves base model + extended_thinking
+    res_flash_think = await backend.ask(AskRequest(prompt="fast deep", model="flash-thinking"))
+    assert res_flash_think.resolved_model == "gemini-flash-thinking"
+    assert backend.normalize_model("flash-thinking") == "gemini-flash-thinking"
+    assert client.sent_calls[1]["model"].model_name == "gemini-flash"
+    assert client.sent_calls[1]["extended_thinking"] is True
 
 
 async def test_cookie_backend_auth_error_clears_cache_and_translates(
@@ -241,3 +271,120 @@ async def test_cookie_backend_timeout_translation(tmp_path: Path) -> None:
 
     with pytest.raises(BackendError, match="timed out"):
         await backend.ask(AskRequest(prompt="slow"))
+
+
+async def test_cookie_backend_rejects_silent_guest_downgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upstream gemini-webapi can silently fall back to Guest (UNAUTHENTICATED) without raising."""
+    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path / "cache"))
+    cache_path = get_rotated_cache_path("psid-guest")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        '[{"name": "__Secure-1PSIDTS", "value": "expired-cached-ts"}]',
+        encoding="utf-8",
+    )
+
+    class GuestOnExpiredClient(FakeGeminiClient):
+        async def init(self, **kwargs: Any) -> None:
+            await super().init(**kwargs)
+            if self.secure_1psidts == "expired-cached-ts":
+                # Simulate upstream silent Guest fallback: no exception raised by init()
+                self._cookie_source = "Guest"
+                self.account_status = AccountStatus.UNAUTHENTICATED
+                self.models = [
+                    FakeAvailableModel("gemini-flash", "id_flash", is_available=True),
+                    FakeAvailableModel("gemini-pro", "id_pro", is_available=False),
+                ]
+            elif self.secure_1psidts == "dead-static-ts":
+                self._cookie_source = "Guest"
+                self.account_status = AccountStatus.UNAUTHENTICATED
+
+    settings = Settings(
+        cookies_path=tmp_path / "cookies.json",
+        sessions_db_path=tmp_path / "sessions.db",
+    )
+
+    # Case 1: Rotated cache downgrades to Guest -> clears cache and succeeds with fresh static ts
+    loader_recover = AuthLoader(
+        cookies_path=settings.cookies_path,
+        env={"GEMINI_SECURE_1PSID": "psid-guest", "GEMINI_SECURE_1PSIDTS": "valid-static-ts"},
+        browser_loader=lambda: {},
+    )
+    backend_ok = CookieBackend(
+        settings, auth_loader=loader_recover, client_factory=GuestOnExpiredClient
+    )
+    health_ok = await backend_ok.health()
+    assert health_ok.ok is True
+    assert not cache_path.exists()
+
+    # Case 2: Static credentials also downgrade to Guest -> health() reports ok=False (not True!)
+    loader_dead = AuthLoader(
+        cookies_path=settings.cookies_path,
+        env={"GEMINI_SECURE_1PSID": "psid-guest", "GEMINI_SECURE_1PSIDTS": "dead-static-ts"},
+        browser_loader=lambda: {},
+    )
+    backend_dead = CookieBackend(
+        settings, auth_loader=loader_dead, client_factory=GuestOnExpiredClient
+    )
+    health_dead = await backend_dead.health()
+    assert health_dead.ok is False
+    assert "authentication failed" in health_dead.message
+
+
+async def test_cookie_backend_runtime_auth_error_resets_and_hot_reloads_cookies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When cookies expire mid-run, updating cookies.json works on retry without restart."""
+    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path / "cache"))
+    cookies_file = tmp_path / "cookies.json"
+    cookies_file.write_text(
+        json.dumps({"__Secure-1PSID": "psid-old", "__Secure-1PSIDTS": "ts-old"}),
+        encoding="utf-8",
+    )
+
+    expire_now = False
+
+    class ExpiringChat(FakeChatSession):
+        async def send_message(self, prompt: str, **kwargs: Any) -> FakeOutput:
+            if expire_now and self.client.secure_1psid == "psid-old":
+                raise AuthError("Session expired at runtime")
+            return await super().send_message(prompt, **kwargs)
+
+    class ExpiringClient(FakeGeminiClient):
+        def start_chat(self, **kwargs: Any) -> ExpiringChat:
+            return ExpiringChat(self, **kwargs)
+
+    settings = Settings(
+        cookies_path=cookies_file,
+        sessions_db_path=tmp_path / "sessions.db",
+    )
+    loader = AuthLoader(cookies_path=cookies_file, env={}, browser_loader=lambda: {})
+    backend = CookieBackend(settings, auth_loader=loader, client_factory=ExpiringClient)
+
+    # Turn 1 succeeds with initial cookies.json
+    r1 = await backend.ask(AskRequest(prompt="turn1"))
+    assert r1.text == "reply:turn1"
+
+    # Cookies expire mid-run -> ask() raises actionable BackendError and resets backend state
+    expire_now = True
+    with pytest.raises(BackendError, match="authentication failed"):
+        await backend.ask(AskRequest(prompt="turn2-fail"))
+
+    # User updates cookies.json on disk without restarting MCP server -> next retry succeeds!
+    cookies_file.write_text(
+        json.dumps({"__Secure-1PSID": "psid-fresh", "__Secure-1PSIDTS": "ts-fresh"}),
+        encoding="utf-8",
+    )
+    r2 = await backend.ask(AskRequest(prompt="turn2-recovered"))
+    assert r2.text == "reply:turn2-recovered"
+
+
+def test_create_backend_rejects_unknown_backend(tmp_path: Path) -> None:
+    settings = Settings(
+        backend="unknown-bridge",
+        cookies_path=tmp_path / "cookies.json",
+        sessions_db_path=tmp_path / "sessions.db",
+    )
+    with pytest.raises(ValueError, match="Unsupported backend"):
+        create_backend(settings)

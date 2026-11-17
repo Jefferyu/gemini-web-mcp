@@ -216,12 +216,14 @@ export GEMINI_SECURE_1PSIDTS="your-1psidts-cookie-value"
 | :--- | :--- | :--- |
 | `GEMINI_WEB_MCP_PROXY` | Fallback to `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | HTTP/SOCKS proxy URL passed to `curl-cffi` |
 | `GEMINI_WEB_MCP_DEFAULT_MODEL` | `unspecified` | Default model (`unspecified`, `flash`, `pro`, `thinking`, or exact name) |
+| `GEMINI_WEB_MCP_ENABLE_BROWSER_COOKIES` | `true` | Enable/disable `browser-cookie3` local browser fallback (`true`/`false`) |
 | `GEMINI_WEB_MCP_COOKIES_PATH` | `~/.config/gemini-web-mcp/cookies.json` | Path to JSON cookie file |
 | `GEMINI_WEB_MCP_SESSIONS_DB_PATH` | `~/.config/gemini-web-mcp/sessions.db` | Path to SQLite WAL session store |
 | `GEMINI_WEB_MCP_TIMEOUT_SECONDS` | `120` | Standard request timeout (seconds) |
 | `GEMINI_WEB_MCP_THINKING_TIMEOUT_SECONDS` | `300` | Timeout when `thinking` mode is active |
 | `GEMINI_WEB_MCP_MAX_FILES_PER_REQUEST` | `10` | Max attachments per `gemini_ask` call |
 | `GEMINI_WEB_MCP_MAX_FILE_SIZE_MB` | `20` | Max size per attachment (MB) |
+| `GEMINI_WEB_MCP_MAX_TOTAL_FILE_SIZE_MB` | `50` | Max combined size of attachments per call (MB) |
 | `GEMINI_WEB_MCP_LOG_LEVEL` | `WARNING` | `stderr` log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 
 > **Client Timeout Tip**: For `model="thinking"` or large file uploads, configure your MCP client's tool call timeout >= `300` seconds if supported. `gemini-web-mcp` emits MCP progress heartbeats every 10 seconds to reduce idle-disconnects.
